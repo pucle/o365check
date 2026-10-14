@@ -83,7 +83,9 @@ def to_local_naive(dt: datetime) -> datetime:
 
 
 class Ctx:
-    engine: FaceEngine
+    engine: Optional[FaceEngine] = None
+    engine_status: str = "pending"   # pending | loading | ready | failed
+    engine_error: str = ""
     store: Storage
     gallery: Gallery
     presence: PresenceEngine
@@ -114,6 +116,31 @@ def auth(x_api_token: str = Header(default="")) -> None:
 
 def S(key: str):
     return ctx.settings[key]
+
+
+def default_model_name() -> str:
+    explicit = os.getenv("MODEL_NAME", "").strip()
+    if explicit:
+        return explicit
+    if os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"):
+        return "buffalo_s"
+    return "buffalo_l"
+
+
+def skip_model_warmup() -> bool:
+    v = os.getenv("SKIP_MODEL_WARMUP", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return bool(os.getenv("RENDER") or os.getenv("RENDER_SERVICE_ID"))
+
+
+def get_engine() -> FaceEngine:
+    if ctx.engine is not None:
+        return ctx.engine
+    if ctx.engine_status == "failed":
+        raise HTTPException(503, "Không tải được model nhận diện (thường do hết RAM trên Render Free). "
+                                 "Đặt MODEL_NAME=buffalo_s và SKIP_MODEL_WARMUP=1 rồi deploy lại.")
+    raise HTTPException(503, "Model đang tải, thử lại sau ~30–60 giây (cold start Render).")
 
 
 def require_env() -> None:
@@ -319,22 +346,9 @@ async def lifespan(app: FastAPI):
             ctx.settings[k] = config.coerce(k, v)
         except ValueError:
             pass
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            ctx.engine = FaceEngine(os.getenv("MODEL_NAME", "buffalo_l"))
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            log.warning("Tải model lần %d thất bại: %s", attempt, type(e).__name__)
-            await asyncio.sleep(2 * attempt)
-    if last_err is not None:
-        raise RuntimeError("Không tải được InsightFace/ONNX. Kiểm tra mạng lúc build/runtime và INSIGHTFACE_HOME.") from last_err
-    try:
-        log.info("Làm nóng model: %.2f giây", await asyncio.to_thread(ctx.engine.warmup, int(S("det_size_enroll"))))
-    except Exception:
-        log.exception("làm nóng model lỗi (bỏ qua)")
+    ctx.engine = None
+    ctx.engine_status = "loading"
+    ctx.engine_error = ""
     ctx.gallery = Gallery()
     load_gallery()
 
@@ -355,8 +369,36 @@ async def lifespan(app: FastAPI):
             ctx.handoff[m] = datetime.fromisoformat(t0)
         except (TypeError, ValueError):
             pass
-    log.info("Sẵn sàng: %d mẫu khuôn mặt, %d trạng thái hiện diện được khôi phục, providers=%s",
-             len(ctx.gallery.ids), restored, ctx.engine.providers)
+    log.info("DB sẵn sàng: %d mẫu khuôn mặt, %d trạng thái hiện diện khôi phục; model=%s (tải nền)",
+             len(ctx.gallery.ids), restored, default_model_name())
+
+    def _load_engine_sync() -> FaceEngine:
+        name = default_model_name()
+        log.info("Đang tải InsightFace %s …", name)
+        eng = FaceEngine(name)
+        if not skip_model_warmup():
+            warm = min(int(S("det_size_enroll")), 320)
+            log.info("Làm nóng model (%d px) …", warm)
+            eng.warmup(warm)
+        else:
+            log.info("Bỏ qua warmup model (SKIP_MODEL_WARMUP / Render)")
+        return eng
+
+    async def engine_loader():
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                ctx.engine = await asyncio.to_thread(_load_engine_sync)
+                ctx.engine_status = "ready"
+                log.info("Model sẵn sàng: %s providers=%s", ctx.engine.model_name, ctx.engine.providers)
+                return
+            except Exception as e:
+                last_err = e
+                ctx.engine_error = type(e).__name__
+                log.warning("Tải model lần %d thất bại: %s", attempt, type(e).__name__)
+                await asyncio.sleep(2 * attempt)
+        ctx.engine_status = "failed"
+        log.error("Không tải được model sau 3 lần: %s", ctx.engine_error)
 
     def tick_once():
         ts = now()
@@ -377,8 +419,10 @@ async def lifespan(app: FastAPI):
             except Exception:
                 log.exception("ticker lỗi")
 
+    engine_task = asyncio.create_task(engine_loader())
     task = asyncio.create_task(ticker())
     yield
+    engine_task.cancel()
     task.cancel()
     with ctx.plock:
         ctx.store.kv_set("presence", ctx.presence.snapshot())
@@ -413,14 +457,16 @@ def health():
     engine = getattr(ctx, "engine", None)
     gallery = getattr(ctx, "gallery", None)
     body = {
-        "ok": bool(db_ok and engine is not None),
+        "ok": db_ok,
         "db": db_ok,
+        "model_ready": engine is not None,
+        "model_status": getattr(ctx, "engine_status", "unknown"),
         "providers": getattr(engine, "providers", []),
-        "model": getattr(engine, "model_name", None),
+        "model": getattr(engine, "model_name", None) or default_model_name(),
         "embeddings": len(gallery.ids) if gallery is not None else 0,
         "members": len(gallery.members()) if gallery is not None else 0,
     }
-    if not body["ok"]:
+    if not db_ok:
         return JSONResponse(body, status_code=503)
     return body
 
@@ -484,7 +530,7 @@ def api_pose(file: UploadFile = File(...), size: int = Form(320)):
     if img is None:
         raise HTTPException(400, "Không đọc được ảnh.")
     h, w = img.shape[:2]
-    faces = ctx.engine.analyze(img, det_size=max(160, min(960, size)), embed=False)
+    faces = get_engine().analyze(img, det_size=max(160, min(960, size)), embed=False)
     return {"w": w, "h": h, "faces": [f.brief() for f in faces]}
 
 
@@ -501,7 +547,7 @@ def api_enroll_frame(file: UploadFile = File(...), member_id: str = Form(...), s
     img = read_image(file)
     if img is None:
         raise HTTPException(400, "Không đọc được ảnh.")
-    face = ctx.engine.best_face(img, det_size=S("det_size_door") if source == "door" else S("det_size_room"), flip=flip, occ=occ)
+    face = get_engine().best_face(img, det_size=S("det_size_door") if source == "door" else S("det_size_room"), flip=flip, occ=occ)
     res = enroll_face(member_id, face, source, step, flip, dedup, uuid.uuid4().hex[:12], jpeg_of(img))
     res["summary"] = member_summary(member_id)
     return res
@@ -526,7 +572,7 @@ def api_enroll_batch(member_id: str = Form(...), source: str = Form("door"), max
         if img is None:
             skipped["bad_image"] += 1
             continue
-        face = ctx.engine.best_face(img, det_size=S("det_size_door") if source == "door" else S("det_size_room"), flip=flip, occ=occ)
+        face = get_engine().best_face(img, det_size=S("det_size_door") if source == "door" else S("det_size_room"), flip=flip, occ=occ)
         r = enroll_face(member_id, face, source, "batch", flip, dedup, uuid.uuid4().hex[:12], jpeg_of(img))
         if r["accepted"]:
             kept += 1
@@ -603,7 +649,7 @@ def feed_session(sess, img: Optional[np.ndarray], label: str = "") -> dict:
         sess.rejects["bad_image"] += 1
         return {"state": "bad_image", "name": label, "kept": False}
     dataset = sess.kind == "dataset"
-    info, cand = enrolling.observe(ctx.engine, img, cfg, int(S("det_size_door") if dataset else S("det_size_enroll")), keep_other=dataset)
+    info, cand = enrolling.observe(get_engine(), img, cfg, int(S("det_size_door") if dataset else S("det_size_enroll")), keep_other=dataset)
     kept = False
     if cand is not None and not dataset and sess.total() >= 6:      # đổi người giữa chừng
         cen = sess.centroid()
@@ -661,7 +707,7 @@ def compute_plan(sess, body: FinishIn) -> dict:
         other_ids = [ctx.gallery.ids[i] for i in other_rows]
     names = {m: ctx.store.member_name(m) for m in set(other_ids)}
     opts = {"target": body.target, "flip": body.flip, "augment": body.augment, "verify": body.verify}
-    return enrolling.build_plan(sess, ctx.engine, cfg, own, other_mat, other_ids, names, opts,
+    return enrolling.build_plan(sess, get_engine(), cfg, own, other_mat, other_ids, names, opts,
                                 MAX_IMAGES_PER_MEMBER, S("door_threshold"), S("door_margin"))
 
 
@@ -776,7 +822,7 @@ def api_recognize(file: UploadFile = File(...), context: str = Form("room"), str
     img = read_image(file)
     if img is None:
         raise HTTPException(400, "Không đọc được ảnh.")
-    faces = ctx.engine.analyze(img, det_size=S("det_size_door") if context == "door" else S("det_size_room"))
+    faces = get_engine().analyze(img, det_size=S("det_size_door") if context == "door" else S("det_size_room"))
     out, saved = [], 0
     for f in faces:
         d = recognize_face(f, context)
@@ -834,7 +880,7 @@ def checkin(files: List[UploadFile] = File(...)):
         img = read_image(up)
         if img is None:
             continue
-        f = ctx.engine.best_face(img, det_size=S("det_size_door"))
+        f = get_engine().best_face(img, det_size=S("det_size_door"))
         if f is None:
             frames.append({"reason": "no_face"})
             continue
@@ -879,7 +925,7 @@ def room_frame(file: UploadFile = File(...)):
         raise HTTPException(400, "Không đọc được ảnh.")
     ts, out = now(), []
     need = int(S("room_votes"))
-    for f in ctx.engine.analyze(img, det_size=S("det_size_room")):
+    for f in get_engine().analyze(img, det_size=S("det_size_room")):
         d = recognize_face(f, "room")
         who = d["member_id"]
         confirmed = False
@@ -910,7 +956,7 @@ def room_identify(track_ids: str = Form(...), files: List[UploadFile] = File(...
         img = read_image(up)
         res = {"track_id": tid, "face_found": False, "member_id": None, "score": 0.0}
         if img is not None:
-            faces = ctx.engine.analyze_crop(img)
+            faces = get_engine().analyze_crop(img)
             if faces:
                 f = faces[0]
                 d = recognize_face(f, "room")
@@ -977,7 +1023,11 @@ def api_status():
             "room": ctx.room, "pending_handoff": list(ctx.handoff),
             "open": S("open_hour") <= ts.hour < S("close_hour"),
             "counts": {"members": len(names), "embeddings": len(ctx.gallery.ids), "strangers": int(len(ctx.store.strangers()))},
-            "engine": {"providers": ctx.engine.providers, "model": ctx.engine.model_name},
+            "engine": (
+                {"providers": ctx.engine.providers, "model": ctx.engine.model_name}
+                if ctx.engine is not None
+                else {"providers": [], "model": default_model_name(), "status": ctx.engine_status}
+            ),
             "settings": {k: S(k) for k in ("open_hour", "close_hour", "grace_s")}}
 
 

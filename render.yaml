@@ -16,7 +16,11 @@ services:
       - key: APP_ENV
         value: production
       - key: MODEL_NAME
-        value: buffalo_l
+        value: buffalo_s
+      - key: SKIP_MODEL_WARMUP
+        value: "1"
+      - key: FACE_MAX_CONCURRENCY
+        value: "1"
       - key: CORS_ORIGINS
         sync: false
       - key: INSIGHTFACE_HOME

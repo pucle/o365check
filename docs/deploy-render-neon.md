@@ -136,7 +136,9 @@ Có **hai cách** tạo dịch vụ; chọn một.
    | `DATABASE_URL` | Có | Neon pooled + `sslmode=require` |
    | `APP_ENV` | Không | `production` |
    | `TZ_NAME` | Không | `Asia/Ho_Chi_Minh` |
-   | `MODEL_NAME` | Không | `buffalo_l` |
+   | `MODEL_NAME` | Không | **`buffalo_s`** trên Free; `buffalo_l` cần RAM lớn hơn |
+   | `SKIP_MODEL_WARMUP` | Không | `1` trên Render Free |
+   | `FACE_MAX_CONCURRENCY` | Không | `1` trên Render Free |
    | `INSIGHTFACE_HOME` | Không | `/home/user/.insightface` |
    | `CORS_ORIGINS` | Không | *(trống hoặc origin UI)* |
 
@@ -147,7 +149,7 @@ Có **hai cách** tạo dịch vụ; chọn một.
 ### Trong lúc build và deploy
 
 1. Tab **Logs** → **Build logs**:
-   - Cài Python deps, tải InsightFace `buffalo_l` (~280 MB) — **5–15 phút** là bình thường.
+   - Cài Python deps, tải InsightFace (mặc định image: **`buffalo_s`**) — **5–15 phút** là bình thường.
    - Build fail thường do: hết thời gian build Free, lỗi mạng khi tải model, thiếu thư viện hệ thống (Dockerfile repo đã cài `libgl1`, `g++`, …).
 
 2. Tab **Logs** → **Deploy logs** (runtime):
@@ -230,6 +232,7 @@ Webcam trình duyệt chỉ chạy trên `localhost` hoặc **HTTPS**. URL `*.on
 | Deploy crash ngay khi start | Thiếu `API_TOKEN` / `DATABASE_URL` | Environment → thêm secret → Save → Manual Deploy |
 | `API_TOKEN quá yếu` | `APP_ENV=production` + token `dev` | Đổi token mạnh trên Render |
 | `/api/health` 503, `db: false` | Sai `DATABASE_URL`, Neon suspend, hết compute | Kiểm tra Neon dashboard; dùng pooled URL; mở project Neon |
+| **Out of memory (512Mi)** / crash trước khi mở port | `buffalo_l` + warmup quá nặng | Trên Render Dashboard đặt `MODEL_NAME=buffalo_s`, `SKIP_MODEL_WARMUP=1`, `FACE_MAX_CONCURRENCY=1`; push code mới (Docker preload `buffalo_s`); **Manual Deploy** |
 | 502 / timeout khi đăng ký | RAM Free thấp, request lớn | Giảm kích thước khung; tránh upload quá nhiều ảnh một lần; thử lại sau cold start |
 | Trang trắng / 404 UI | Sai URL | Dùng `/ui/` hoặc `/` (redirect sang UI) |
 | 401 mọi API | Token UI ≠ `API_TOKEN` Render | Đồng bộ token trong dialog Token |
@@ -276,7 +279,8 @@ Xem `.env.example`.
 | `DATABASE_URL` | Có | Neon pooled |
 | `APP_ENV` | Khuyến nghị `production` | |
 | `TZ_NAME` | Không | Mặc định blueprint: `Asia/Ho_Chi_Minh` |
-| `MODEL_NAME` | Không | `buffalo_l` |
+| `MODEL_NAME` | Không | `buffalo_s` (Free) / `buffalo_l` (RAM đủ) |
+| `SKIP_MODEL_WARMUP` | Khuyến nghị `1` trên Free | |
 | `CORS_ORIGINS` | Khi UI khác domain | |
 | `PORT` | Không (Render tự gán) | |
 
@@ -288,7 +292,7 @@ Local dev: `APP_ENV=local`, `PORT=7860`, cùng `DATABASE_URL` Neon hoặc Neon b
 
 - **Render Free**: sleep, giới hạn build minutes/tháng, RAM ~512MB, không persistent disk.
 - **Neon Free**: giới hạn storage và compute; project có thể auto-suspend.
-- Model `buffalo_l` nằm trong **Docker image** (build time), không phụ thuộc disk Render sau restart.
+- Model mặc định trong **Docker image**: `buffalo_s` (phù hợp Free). Server mở cổng trước, tải model **nền**; `/api/health` trả `ok` khi DB OK, `model_ready` khi model xong.
 
 ---
 

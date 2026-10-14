@@ -12,8 +12,10 @@ WORKDIR /home/user/app
 COPY --chown=user requirements-server.txt .
 RUN pip install --no-cache-dir cython "numpy<2" && pip install --no-cache-dir -r requirements-server.txt
 
-# Tải sẵn model lúc build. Restart Render không giữ cache ngoài image, nên model nằm trong layer Docker.
-RUN python -c "from insightface.app import FaceAnalysis; FaceAnalysis(name='buffalo_l', root='/home/user/.insightface', providers=['CPUExecutionProvider'], allowed_modules=['detection','recognition','landmark_3d_68'])"
+# buffalo_s (~100MB RAM) vừa Render Free; buffalo_l cần RAM lớn hơn — đổi build-arg nếu instance trả phí.
+ARG INSIGHTFACE_MODEL=buffalo_s
+ENV INSIGHTFACE_MODEL=${INSIGHTFACE_MODEL}
+RUN python -c "import os; from insightface.app import FaceAnalysis; n=os.environ['INSIGHTFACE_MODEL']; FaceAnalysis(name=n, root='/home/user/.insightface', providers=['CPUExecutionProvider'], allowed_modules=['detection','recognition','landmark_3d_68'])"
 
 COPY --chown=user . .
 

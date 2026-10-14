@@ -75,6 +75,15 @@ try:
           f"{r.status_code} {str(body)[:160]} ({dt:.1f}s; cold start Render có thể chậm)")
     if "db" in body:
         check("health.db", body.get("db") is True, str(body.get("db")))
+    if body.get("model_ready") is False and body.get("model_status") == "loading":
+        for _ in range(8):
+            time.sleep(5)
+            r2, _ = req("GET", "/api/health", headers=BASE)
+            if r2.status_code == 200 and r2.json().get("model_ready"):
+                body = r2.json()
+                break
+    if "model_ready" in body:
+        check("model ready", body.get("model_ready") is True, body.get("model_status", ""))
     check("không token -> bị từ chối", req("GET", "/api/members", headers=BASE)[0].status_code in (401, 403))
     check("sai token -> bị từ chối",
           req("GET", "/api/members", headers={**BASE, "X-API-Token": "sai-token"})[0].status_code in (401, 403))

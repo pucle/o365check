@@ -78,12 +78,23 @@ def _unit(v: np.ndarray) -> np.ndarray:
 
 class FaceEngine:
     def __init__(self, model_name: str = "buffalo_l", det_size: int = 640, det_thresh: float = 0.45,
-                 max_concurrency: int = 2):
+                 max_concurrency: Optional[int] = None):
         import onnxruntime as ort
         from insightface.app import FaceAnalysis
 
+        if max_concurrency is None:
+            max_concurrency = int(os.getenv("FACE_MAX_CONCURRENCY", "1" if os.getenv("RENDER") else "2"))
         avail = ort.get_available_providers()
         providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail] or ["CPUExecutionProvider"]
+        # Giảm thread ORT để tránh spike RAM trên Render Free (~512Mi).
+        if providers == ["CPUExecutionProvider"]:
+            try:
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 1
+                opts.inter_op_num_threads = 1
+                ort.set_default_session_options(opts)
+            except Exception:
+                pass
         self.providers = providers
         self.model_name = model_name
         root = os.getenv("INSIGHTFACE_HOME", "~/.insightface")
